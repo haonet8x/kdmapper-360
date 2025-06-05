@@ -1,0 +1,51 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="intel_driver.cpp">
+      <Filter>Mapper</Filter>
+    </ClCompile>
+    <ClCompile Include="kdmapper.cpp">
+      <Filter>Mapper</Filter>
+    </ClCompile>
+    <ClCompile Include="portable_executable.cpp">
+      <Filter>Mapper</Filter>
+    </ClCompile>
+    <ClCompile Include="service.cpp">
+      <Filter>Mapper</Filter>
+    </ClCompile>
+    <ClCompile Include="utils.cpp">
+      <Filter>Mapper</Filter>
+    </ClCompile>
+    <ClCompile Include="DriverCtrl.cpp" />
+    <ClCompile Include="main.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="utils.hpp">
+      <Filter>Mapper</Filter>
+    </ClInclude>
+    <ClInclude Include="intel_driver.hpp">
+      <Filter>Mapper</Filter>
+    </ClInclude>
+    <ClInclude Include="intel_driver_resource.hpp">
+      <Filter>Mapper</Filter>
+    </ClInclude>
+    <ClInclude Include="kdmapper.hpp">
+      <Filter>Mapper</Filter>
+    </ClInclude>
+    <ClInclude Include="nt.hpp">
+      <Filter>Mapper</Filter>
+    </ClInclude>
+    <ClInclude Include="portable_executable.hpp">
+      <Filter>Mapper</Filter>
+    </ClInclude>
+    <ClInclude Include="service.hpp">
+      <Filter>Mapper</Filter>
+    </ClInclude>
+    <ClInclude Include="DriverCtrl.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Mapper">
+      <UniqueIdentifier>{ed07652e-0642-4028-83e7-d4a098123186}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

