@@ -6,5 +6,4 @@ EneIo64.sys
 版本号	21H2
 操作系统内部版本	19044.1645
 
-
-VMware® Workstation 17 Pro
+感谢作者： 禁锢在时空之中的灵魂  KdMapper扩展实现之ASUS(EneIo64.sys)
